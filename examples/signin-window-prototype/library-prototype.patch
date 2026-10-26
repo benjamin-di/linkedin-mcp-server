@@ -1,0 +1,1147 @@
+diff --git a/examples/linkedin/app.py b/examples/linkedin/app.py
+new file mode 100644
+index 0000000..753ef84
+--- /dev/null
++++ b/examples/linkedin/app.py
+@@ -0,0 +1,115 @@
++"""Optional login surface around upstream's own LinkedIn login child."""
++
++from __future__ import annotations
++
++import argparse
++import contextlib
++import json
++import os
++import sys
++from dataclasses import asdict
++from pathlib import Path
++
++from linkedin_mcp_server.config import load_config
++from linkedin_mcp_server.profile_claim import ensure_profile_claim
++from starlette.applications import Starlette
++from starlette.responses import JSONResponse
++from starlette.routing import Route
++
++from signin_window.child import run_child
++from signin_window.client import LocalBackend
++from signin_window.page import PageText
++from signin_window.relay import Relay
++from signin_window.service import Windows
++from signin_window.state import atomic_private_write
++
++WORKER = Path(__file__).with_name("worker.py")
++
++
++def make_app(
++    config, *, display, public_url, token, novnc_dir, synthetic=True, fail_export=False, windows_factory=Windows
++):
++    if len(token) < 32:
++        raise ValueError("a token of at least 32 characters is required")
++    ensure_profile_claim(Path(config.browser.user_data_dir))
++
++    async def login(window):
++        private = Path(window.temp_profile("login-settings-")) / "config.json"
++        atomic_private_write(private, json.dumps(asdict(config)).encode())
++        argv = [sys.executable, str(WORKER), "--config", str(private)]
++        if synthetic:
++            argv.append("--synthetic")
++        if fail_export:
++            argv.append("--fail-export")
++        allowed = (
++            "PATH",
++            "LD_LIBRARY_PATH",
++            "LANG",
++            "LC_ALL",
++            "TZ",
++            "XDG_CONFIG_DIRS",
++            "XDG_DATA_DIRS",
++            "PLAYWRIGHT_BROWSERS_PATH",
++            "XKB_CONFIG_ROOT",
++        )
++        env = window.env({name: os.environ[name] for name in allowed if name in os.environ})
++        # Browser support files belong to this child, never the host's settings directory.
++        env["XDG_CONFIG_HOME"] = str(private.parent / "config")
++        env["XDG_CACHE_HOME"] = str(private.parent / "cache")
++        return await run_child(window, argv, env=env, kept=True, stop_seconds=45)
++
++    windows = windows_factory(login, display=display, save_seconds=60)
++
++    @contextlib.asynccontextmanager
++    async def lifespan(app):
++        relay = Relay(
++            LocalBackend(windows, novnc_dir),
++            public_url.rstrip("/") + "/connect",
++            text=PageText(service="LinkedIn", reconnect=True).with_outcomes(
++                failed="<h1>Sign-in could not be confirmed</h1><p>Return to the application to check its session.</p>"
++            ),
++        )
++
++        async def link(request):
++            import hmac
++
++            if not hmac.compare_digest(request.headers.get("authorization", ""), "Bearer " + token):
++                return JSONResponse({"error": "unauthorized"}, status_code=401)
++            created = relay.create("account")
++            return JSONResponse({"url": created.url, "expires_at": created.expires_at})
++
++        app.router.routes[:] = [Route("/link", link, methods=["POST"]), *relay.routes("/connect")]
++        app.state.relay, app.state.windows = relay, windows
++        async with windows.lifespan(), relay.lifespan():
++            yield
++
++    return Starlette(lifespan=lifespan)
++
++
++def main():
++    import uvicorn
++
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--profile", type=Path, required=True)
++    parser.add_argument("--token-file", type=Path, required=True)
++    parser.add_argument("--novnc-dir", type=Path, required=True)
++    parser.add_argument("--display", required=True)
++    parser.add_argument("--port", type=int, default=8766)
++    parser.add_argument("--synthetic", action="store_true", required=True)
++    args = parser.parse_args()
++    config = load_config()
++    config.browser.user_data_dir = str(args.profile)
++    config.validate()
++    app = make_app(
++        config,
++        display=args.display,
++        public_url=f"http://127.0.0.1:{args.port}",
++        token=args.token_file.read_text().strip(),
++        novnc_dir=args.novnc_dir,
++        synthetic=args.synthetic,
++    )
++    uvicorn.run(app, host="127.0.0.1", port=args.port, access_log=False)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/examples/linkedin/synthetic.py b/examples/linkedin/synthetic.py
+new file mode 100644
+index 0000000..5931557
+--- /dev/null
++++ b/examples/linkedin/synthetic.py
+@@ -0,0 +1,41 @@
++"""A test-only provider surface. Every context request is fulfilled or aborted."""
++
++from urllib.parse import urlsplit
++
++from linkedin_mcp_server import setup
++from linkedin_mcp_server.core import BrowserManager
++
++SIGNIN = """<!doctype html><title>Synthetic sign-in</title>
++<button autofocus onclick="document.cookie='li_at=synthetic-cookie; path=/; SameSite=Lax';
++ location.href='/feed/'">Complete synthetic sign-in</button>"""
++FEED = "<!doctype html><title>Synthetic feed</title><h1>Synthetic connected account</h1>"
++
++
++def install(*, fail_export=False):
++    class SyntheticBrowser(BrowserManager):
++        async def start(self):
++            await super().start()
++
++            async def route(request_route):
++                parts = urlsplit(request_route.request.url)
++                if (
++                    parts.scheme == "https"
++                    and parts.hostname == "www.linkedin.com"
++                    and parts.path in ("/login", "/feed/")
++                ):
++                    await request_route.fulfill(
++                        content_type="text/html", body=SIGNIN if parts.path == "/login" else FEED
++                    )
++                else:
++                    await request_route.abort()
++
++            await self.context.route("**/*", route)
++
++        async def export_cookies(self, cookie_path=None):
++            if fail_export:
++                return False
++            return await super().export_cookies(cookie_path)
++
++    # Only the synthetic launcher installs this fixture seam. Browser launch,
++    # the manual-login detector, profile lease, rotation and restoration stay real.
++    setup.BrowserManager = SyntheticBrowser
+diff --git a/examples/linkedin/test_acceptance.py b/examples/linkedin/test_acceptance.py
+new file mode 100644
+index 0000000..99348d5
+--- /dev/null
++++ b/examples/linkedin/test_acceptance.py
+@@ -0,0 +1,190 @@
++"""Real borrowed-display viewer and upstream profile lifecycle, with synthetic pages."""
++
++import asyncio
++import os
++import socket
++import subprocess
++import threading
++import time
++from concurrent.futures import ThreadPoolExecutor
++from pathlib import Path
++
++import httpx
++import pytest
++import uvicorn
++from app import make_app
++from linkedin_mcp_server.config import AppConfig
++from linkedin_mcp_server.profile_lease import get_profile_lease
++from linkedin_mcp_server.session_state import load_source_state, portable_cookie_path
++from playwright.sync_api import sync_playwright
++
++from signin_window.service import Windows
++
++TOKEN = "synthetic-linkedin-viewer-token-0000000000"
++
++
++def wait_for(predicate, seconds=20):
++    deadline = time.monotonic() + seconds
++    while not predicate():
++        assert time.monotonic() < deadline, "acceptance deadline exceeded"
++        time.sleep(0.05)
++
++
++@pytest.fixture
++def host(tmp_path, monkeypatch, request):
++    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "viewer-config"))
++    display = next(
++        n
++        for n in range(210, 310)
++        if not Path(f"/tmp/.X{n}-lock").exists() and not Path(f"/tmp/.X11-unix/X{n}").exists()
++    )
++    process = subprocess.Popen(
++        [os.environ["SIGNIN_XVFB"], f":{display}", "-screen", "0", "1920x1080x24", "-nolisten", "tcp"],
++        stdout=subprocess.DEVNULL,
++        stderr=subprocess.DEVNULL,
++    )
++    wait_for(lambda: Path(f"/tmp/.X11-unix/X{display}").exists())
++    profile = tmp_path / "auth" / "profile"
++    config = AppConfig()
++    config.browser.user_data_dir = str(profile)
++    config.browser.chrome_path = os.environ["LINKEDIN_TEST_CHROME"]
++    config.browser.login_timeout_seconds = 30
++    sock = socket.socket()
++    sock.bind(("127.0.0.1", 0))
++    origin = f"http://127.0.0.1:{sock.getsockname()[1]}"
++
++    def factory(runner, **kwargs):
++        return Windows(runner, x11vnc=os.environ["SIGNIN_X11VNC"], **kwargs)
++
++    app = make_app(
++        config,
++        display=f":{display}",
++        public_url=origin,
++        token=TOKEN,
++        novnc_dir=os.environ["NOVNC_DIR"],
++        windows_factory=factory,
++        fail_export=getattr(request, "param", False),
++    )
++    server = uvicorn.Server(uvicorn.Config(app, log_level="error", access_log=False))
++    thread = threading.Thread(target=server.run, kwargs={"sockets": [sock]}, daemon=True)
++    thread.start()
++    wait_for(lambda: server.started)
++    try:
++        yield app, origin, profile, process
++    finally:
++        server.should_exit = True
++        thread.join(55)
++        sock.close()
++        # The host owns this X server. Both successful and cancelled logins must leave it alive.
++        alive = process.poll() is None
++        process.terminate()
++        process.wait(timeout=5)
++        assert alive and not thread.is_alive()
++
++
++def link(origin):
++    response = httpx.post(origin + "/link", headers={"Authorization": "Bearer " + TOKEN})
++    assert response.status_code == 200
++    return response.json()["url"]
++
++
++def open_view(page, url, *, reload=False):
++    page.goto(url)
++    page.locator("#go").click()
++    frame = page.frame_locator("iframe")
++    frame.locator("html.noVNC_connected").wait_for(timeout=25000)
++    if reload:
++        page.reload()
++        frame = page.frame_locator("iframe")
++        frame.locator("html.noVNC_connected").wait_for(timeout=15000)
++    return frame
++
++
++def complete(page, frame):
++    frame.locator("canvas").click(position={"x": 300, "y": 300})
++    page.keyboard.press("Tab")
++    page.keyboard.press("Enter")
++
++
++def current(app):
++    return next(iter(app.state.relay._links.values()))
++
++
++def test_reload_and_publication_keep_upstream_session_format_and_borrowed_display(host):
++    app, origin, profile, display = host
++    assert httpx.post(origin + "/link").status_code == 401
++    url = link(origin)
++    with sync_playwright() as playwright:
++        browser = playwright.chromium.launch(headless=True, executable_path=os.environ["LINKEDIN_TEST_CHROME"])
++        page = browser.new_page()
++        frame = open_view(page, url, reload=True)
++        lease = get_profile_lease(profile)
++        with ThreadPoolExecutor(max_workers=1) as pool:
++            assert not pool.submit(asyncio.run, lease.acquire(timeout=0.1)).result()
++        complete(page, frame)
++        wait_for(lambda: current(app).state in ("connected", "failed"))
++        assert current(app).state == "connected", [w.error for w in app.state.windows._windows.values()]
++        browser.close()
++    state = load_source_state(profile)
++    assert state is not None and state.login_generation
++    assert "synthetic-cookie" in portable_cookie_path(profile).read_text()
++    assert display.poll() is None
++    assert len(app.state.windows._windows) == 1
++    wait_for(lambda: all(not w.procs for w in app.state.windows._windows.values()))
++    assert "synthetic-cookie" not in httpx.get(url + "/state").text
++
++
++def test_page_closure_during_saving_does_not_interrupt_upstream_publication(host):
++    app, origin, profile, _display = host
++    url = link(origin)
++    with sync_playwright() as playwright:
++        browser = playwright.chromium.launch(headless=True, executable_path=os.environ["LINKEDIN_TEST_CHROME"])
++        page = browser.new_page()
++        complete(page, open_view(page, url))
++        wait_for(lambda: any(w.state == "saving" for w in app.state.windows._windows.values()))
++        page.close()
++        wait_for(lambda: current(app).state in ("connected", "failed"))
++        assert current(app).state == "connected"
++        browser.close()
++    assert load_source_state(profile) is not None
++
++
++def test_cancel_restores_the_previous_generation_and_releases_the_profile(host):
++    app, origin, profile, _display = host
++    with sync_playwright() as playwright:
++        browser = playwright.chromium.launch(headless=True, executable_path=os.environ["LINKEDIN_TEST_CHROME"])
++        first = browser.new_page()
++        complete(first, open_view(first, link(origin)))
++        wait_for(lambda: current(app).state in ("connected", "failed"))
++        assert current(app).state == "connected"
++        generation = load_source_state(profile).login_generation
++        previous = portable_cookie_path(profile).read_bytes()
++        first.close()
++        second = browser.new_page()
++        open_view(second, link(origin))
++        second.get_by_role("button", name="Cancel", exact=True).click()
++        wait_for(lambda: all(not w.procs for w in app.state.windows._windows.values()), seconds=45)
++        browser.close()
++    assert load_source_state(profile).login_generation == generation
++    assert portable_cookie_path(profile).read_bytes() == previous
++    # The next independent process may take the restored profile, using upstream's lease.
++    lease = get_profile_lease(profile)
++    assert asyncio.run(lease.acquire(timeout=1))
++    lease.release()
++
++
++@pytest.mark.parametrize("host", [True], indirect=True)
++def test_export_failure_cannot_publish_a_connected_session(host):
++    app, origin, profile, _display = host
++    with sync_playwright() as playwright:
++        browser = playwright.chromium.launch(headless=True, executable_path=os.environ["LINKEDIN_TEST_CHROME"])
++        page = browser.new_page()
++        complete(page, open_view(page, link(origin)))
++        wait_for(lambda: current(app).state in ("connected", "failed"))
++        assert current(app).state == "failed"
++        browser.close()
++    assert load_source_state(profile) is None
++    assert not portable_cookie_path(profile).exists()
++    lease = get_profile_lease(profile)
++    assert asyncio.run(lease.acquire(timeout=1))
++    lease.release()
+diff --git a/examples/linkedin/worker.py b/examples/linkedin/worker.py
+new file mode 100644
+index 0000000..bd3d708
+--- /dev/null
++++ b/examples/linkedin/worker.py
+@@ -0,0 +1,108 @@
++"""Owned login child: upstream controls profiles, browser launch and publication."""
++
++from __future__ import annotations
++
++import argparse
++import asyncio
++import json
++import signal
++from pathlib import Path
++
++from linkedin_mcp_server.config import AppConfig, BrowserConfig, ServerConfig, set_config
++from linkedin_mcp_server.login_viewer import LoginViewer
++from linkedin_mcp_server.session_state import load_source_state, portable_cookie_path
++from linkedin_mcp_server.setup import interactive_login
++
++from signin_window.child import begin_saving, emit
++
++
++class HostedView:
++    """Retain upstream's Openbox lifetime; the host owns VNC on this display."""
++
++    def __init__(self):
++        self.viewer = LoginViewer()
++
++    def start_window_manager(self):
++        self.viewer.start_window_manager()
++
++    def start_remote_control(self):
++        return None  # the parent's relay supplies the expiring address
++
++    def stop_remote_control(self):
++        pass  # the saving progress event revokes control before export
++
++    def stop_window_manager(self):
++        self.viewer.stop_window_manager()
++
++
++async def run(config_file: Path, *, synthetic: bool, fail_export: bool = False):
++    data = json.loads(config_file.read_text())
++    config = AppConfig(
++        browser=BrowserConfig(**data["browser"]),
++        server=ServerConfig(**data["server"]),
++        is_interactive=data["is_interactive"],
++    )
++    config.validate()
++    set_config(config)
++    if synthetic:
++        from synthetic import install
++
++        install(fail_export=fail_export)
++    closed = False
++
++    def observe(progress):
++        nonlocal closed
++        if progress.state == "closed":
++            closed = progress.close_confirmed is True
++        elif progress.state == "saving":
++            begin_saving()
++        else:
++            emit(state=progress.state, host=progress.host)
++
++    task = asyncio.current_task()
++    loop = asyncio.get_running_loop()
++    interrupted = False
++
++    def cancel_once():
++        nonlocal interrupted
++        if not interrupted:
++            interrupted = True
++            task.cancel()
++
++    for signum in (signal.SIGTERM, signal.SIGINT):
++        loop.add_signal_handler(signum, cancel_once)
++    try:
++        profile = Path(config.browser.user_data_dir)
++        succeeded = await interactive_login(profile, login_viewer=True, viewer_factory=HostedView, observer=observe)
++        if (
++            not succeeded
++            or not closed
++            or load_source_state(profile) is None
++            or not portable_cookie_path(profile).is_file()
++        ):
++            emit(state="failed", error="session_not_confirmed")
++            return 1
++        emit(state="connected")
++        return 0
++    except asyncio.CancelledError:
++        emit(state="failed", error="cancelled")
++        return 130
++    except Exception as exc:
++        emit(state="failed", error=type(exc).__name__)
++        return 1
++    finally:
++        for signum in (signal.SIGTERM, signal.SIGINT):
++            loop.remove_signal_handler(signum)
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--config", type=Path, required=True)
++    parser.add_argument("--synthetic", action="store_true")
++    parser.add_argument("--fail-export", action="store_true")
++    args = parser.parse_args()
++    raise SystemExit(asyncio.run(run(args.config, synthetic=args.synthetic, fail_export=args.fail_export)))
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/src/signin_window/child.py b/src/signin_window/child.py
+index c228c54..57c52e6 100644
+--- a/src/signin_window/child.py
++++ b/src/signin_window/child.py
+@@ -5,7 +5,9 @@ The child reports progress on stdout, one line each, ``<PREFIX>{json}``; anythin
+ 
+     {"state": "waiting"}                      the sign-in page is up (the live view opens)
+     {"host": "accounts.example.com"}          the host the window shows now
++    {"state": "saving"}                       revoke control before publication
+     {"state": "signed_in", ...the session}    done: the session to hand over
++    {"state": "connected"}                    kept mode: the child saved its session
+     {"state": "failed", "error": "..."}       it gave up
+ 
+ ``emit`` writes such a line from the child. ``run_child`` runs one in its own process group on the window's display,
+@@ -31,6 +33,7 @@ from .service import Window
+ 
+ PREFIX = "SIGNIN "
+ MAX_LINE = 1024 * 1024  # the last line carries the session
++SAVING_ACK = "SIGNIN saving\n"
+ 
+ 
+ class WindowFailed(Exception):
+@@ -42,6 +45,17 @@ def emit(prefix: str = PREFIX, **fields: Any) -> None:
+     print(prefix + json.dumps(fields), flush=True)
+ 
+ 
++def begin_saving() -> None:
++    """In a kept child, revoke remote control before publishing its session.
++
++    Blocks until ``run_child(kept=True)`` has moved the window to saving. EOF or
++    an unexpected acknowledgement aborts publication. Use the default prefix.
++    """
++    emit(state="saving")
++    if sys.stdin.readline() != SAVING_ACK:
++        raise WindowFailed("saving_not_acknowledged")
++
++
+ def parse(line: bytes, prefix: str = PREFIX) -> dict[str, Any] | None:
+     """One progress line, or None for anything else the child printed."""
+     text = line.decode("utf-8", "replace").strip()
+@@ -60,11 +74,21 @@ async def run_child(
+     *,
+     env: Mapping[str, str] | None = None,
+     prefix: str = PREFIX,
++    kept: bool = False,
++    stop_seconds: float = 5,
+ ) -> dict[str, Any]:
+-    """Run ``argv`` on the window's display (``env`` defaults to ``window.env()``) and return its session."""
++    """Run a child on the window's display and return its session.
++
++    ``kept=True`` instead requires ``connected`` and exit 0, then finishes the
++    window without transferring a session. ``saving`` closes control before
++    publication. ``stop_seconds`` gives an application's owned child time to
++    restore its profile after SIGTERM; cancellation never releases it early.
++    """
++    if stop_seconds <= 0:
++        raise ValueError("stop_seconds must be positive")
+     process = await asyncio.create_subprocess_exec(
+         *argv,
+-        stdin=asyncio.subprocess.DEVNULL,
++        stdin=asyncio.subprocess.PIPE if kept else asyncio.subprocess.DEVNULL,
+         stdout=asyncio.subprocess.PIPE,
+         stderr=asyncio.subprocess.DEVNULL,
+         env={**(env if env is not None else window.env()), "DISPLAY": window.display},
+@@ -73,6 +97,8 @@ async def run_child(
+     )
+     window.procs.append(ProcessGroup(process.pid))
+     session: dict[str, Any] | None = None
++    connected = False
++    unexpected_session = False
+     assert process.stdout is not None
+     try:
+         while line := await process.stdout.readline():
+@@ -84,17 +110,39 @@ async def run_child(
+             state = message.get("state")
+             if state == "waiting":
+                 window.waiting()
++            elif state == "saving":
++                window.saving()
++                if kept:
++                    if window.state != "saving" or window.cancelled.is_set():
++                        raise WindowFailed("saving_not_acknowledged")
++                    assert process.stdin is not None
++                    process.stdin.write(SAVING_ACK.encode())
++                    await process.stdin.drain()
++            elif state == "connected" and kept:
++                connected = True
+             elif state == "failed":
+                 window.error = str(message.get("error") or "failed")[:100]
++                if kept:
++                    unexpected_session = True
+             elif state == "signed_in":
+-                session = {k: v for k, v in message.items() if k != "state"}
++                if kept:
++                    unexpected_session = True
++                else:
++                    session = {k: v for k, v in message.items() if k != "state"}
+         await process.wait()
+     finally:
++        if process.stdin is not None:
++            process.stdin.close()
+         if process.returncode is None:
+             with contextlib.suppress(ProcessLookupError, PermissionError):
+                 os.killpg(process.pid, signal.SIGTERM)
+             with contextlib.suppress(Exception, asyncio.CancelledError):
+-                await asyncio.wait_for(process.wait(), timeout=5)  # reap it: no zombie left behind
++                await asyncio.wait_for(process.wait(), timeout=stop_seconds)  # reap before releasing its profile
++    if kept:
++        if process.returncode != 0 or not connected or unexpected_session or window.cancelled.is_set():
++            raise WindowFailed(window.error or "kept_session_not_confirmed")
++        window.finish("connected")
++        return {}
+     if session is None or process.returncode != 0:
+         raise WindowFailed(window.error or f"exit {process.returncode}")
+     return session
+diff --git a/src/signin_window/client.py b/src/signin_window/client.py
+index 761fb0b..9fe240d 100644
+--- a/src/signin_window/client.py
++++ b/src/signin_window/client.py
+@@ -32,6 +32,88 @@ class LoginBusy(LoginUnavailable):
+     """Every window slot of the login service is in use."""
+ 
+ 
++class LocalBackend:
++    """Embed windows beside an application's login code, without an HTTP service.
++
++    Construct on the host's running event loop. Relay calls the synchronous methods
++    from worker threads; browser/profile ownership stays with the supplied runner.
++    Mount both ``windows.lifespan()`` and ``relay.lifespan()`` in the host.
++    """
++
++    def __init__(self, windows: Any, novnc_dir: str | Path) -> None:
++        self.windows = windows
++        self.novnc_dir = Path(novnc_dir).resolve()
++        self.loop = asyncio.get_running_loop()
++
++    def _run(self, operation):
++        # A synchronous call on the host loop would deadlock that same loop.
++        try:
++            current = asyncio.get_running_loop()
++        except RuntimeError:
++            current = None
++        if current is self.loop:
++            operation.close()
++            raise RuntimeError("call LocalBackend from a worker thread")
++        return asyncio.run_coroutine_threadsafe(operation, self.loop).result()
++
++    def start(self, layout: str = "desktop", **params: Any) -> dict[str, Any]:
++        from .service import Busy
++
++        try:
++            window = self._run(self.windows.start(layout, params))
++        except Busy:
++            raise LoginBusy("busy") from None
++        except (OSError, RuntimeError, ValueError):
++            raise LoginUnavailable("could not start the local window") from None
++        return {**window.public(), "view_token": window.view_token}
++
++    def state(self, window_id: str) -> dict[str, Any]:
++        async def read():
++            window = self.windows.get(window_id)
++            return window.public() if window else {"state": "unknown"}
++
++        return self._run(read())
++
++    def result(self, window_id: str) -> dict[str, Any] | None:
++        async def take():
++            return self.windows.take(window_id)
++
++        return self._run(take())
++
++    def close(self, window_id: str) -> None:
++        self._run(self.windows.close(window_id))
++
++    def static(self, path: str, window_id: str | None = None) -> tuple[int, bytes, str]:
++        import mimetypes
++
++        if not STATIC.fullmatch(path):
++            return 404, b"", ""
++        file = (self.novnc_dir / path).resolve()
++        if not file.is_relative_to(self.novnc_dir) or not file.is_file():
++            return 404, b"", ""
++        try:
++            with file.open("rb") as stream:
++                data = stream.read(MAX_STATIC + 1)
++        except OSError:
++            return 404, b"", ""
++        if len(data) > MAX_STATIC:
++            return 404, b"", ""
++        return 200, data, mimetypes.guess_type(path)[0] or "application/octet-stream"
++
++    async def bridge(self, window_id: str, view_token: str, ws: Any) -> None:
++        from .service import _pipe
++
++        window = self.windows.get(window_id)
++        if window is None or not window.view_ok(view_token) or window.state != "waiting":
++            await ws.close(code=4404)
++            return
++        try:
++            reader, writer = await asyncio.open_connection("127.0.0.1", window.vnc_port)
++        except OSError:
++            raise LoginUnavailable("local viewer unavailable") from None
++        await _pipe(ws, reader, writer, lambda: window.state == "waiting")
++
++
+ class _NoRedirects(urllib.request.HTTPRedirectHandler):
+     def redirect_request(self, *args: Any, **kwargs: Any) -> None:
+         return None
+diff --git a/src/signin_window/page.py b/src/signin_window/page.py
+index b2f2b06..44f50fc 100644
+--- a/src/signin_window/page.py
++++ b/src/signin_window/page.py
+@@ -46,6 +46,8 @@ class PageText:
+     starting: str = "Opening {service}…"
+     waiting: str = "Sign in as you usually do. This page notices when you're in."
+     saving: str = "Signed in. Saving…"
++    #: Keep an active attempt on reload. Requires the host's relay/window lifespans.
++    reconnect: bool = False
+     #: State -> HTML shown when the link ends in that state; your own final states go here too.
+     outcomes: dict[str, str] = field(default_factory=lambda: dict(DEFAULT_OUTCOMES))
+     #: States whose message offers "Try again".
+@@ -92,6 +94,7 @@ def render(text: PageText, label: str | None) -> str:
+         "noRetry": list(text.no_retry),
+         "secureHost": text.secure_host,
+         "frameTitle": text.plain(text.title, label),
++        "reconnect": text.reconnect,
+     }
+     # JSON in a script element: "</" would end it, so it is escaped.
+     script = (
+@@ -202,5 +205,25 @@ async function begin() {
+   poll();
+ }
+ $("go").addEventListener("click", begin);
+-addEventListener("pagehide", () => { if (!over && navigator.sendBeacon) navigator.sendBeacon(`${base}/cancel`); });
++const cancel = document.createElement("button");
++cancel.textContent = "Cancel";
++cancel.hidden = true;
++document.querySelector("header").appendChild(cancel);
++cancel.addEventListener("click", async () => {
++  await fetch(`${base}/cancel`, {method: "POST"});
++  show(await (await fetch(`${base}/state`, {cache: "no-store"})).json());
++});
++if (CONFIG.reconnect) {
++  (async () => {
++    const s = await (await fetch(`${base}/state`, {cache: "no-store"})).json();
++    if (s.state !== "ready") {
++      $("intro").hidden = true;
++      document.querySelector("header .bar").hidden = false;
++      if (!show(s)) poll();
++    }
++  })().catch(() => {});
++  setInterval(() => { cancel.hidden = over || $("intro").hidden === false; }, 250);
++} else {
++  addEventListener("pagehide", () => { if (!over && navigator.sendBeacon) navigator.sendBeacon(`${base}/cancel`); });
++}
+ </script>"""
+diff --git a/src/signin_window/relay.py b/src/signin_window/relay.py
+index b93e156..20e7cf6 100644
+--- a/src/signin_window/relay.py
++++ b/src/signin_window/relay.py
+@@ -33,7 +33,9 @@ Routes, under the prefix you mount them at::
+ 
+ from __future__ import annotations
+ 
++import asyncio
+ import collections
++import contextlib
+ import logging
+ import re
+ import secrets
+@@ -193,6 +195,36 @@ class Relay:
+ 
+     # -- links ----------------------------------------------------------------------------------------------------
+ 
++    @contextlib.asynccontextmanager
++    async def lifespan(self):
++        """Reconcile completion and expiry without a connected page.
++
++        Mount once when using ``routes``; ``app`` installs this automatically.
++        Backends and hooks must honor their own bounded I/O timeouts.
++        """
++
++        stop = asyncio.Event()
++
++        async def follow():
++            while not stop.is_set():
++                await anyio.to_thread.run_sync(self.tick)
++                with contextlib.suppress(TimeoutError):
++                    await asyncio.wait_for(stop.wait(), timeout=0.1)
++
++        task = asyncio.create_task(follow())
++        try:
++            yield self
++        finally:
++            stop.set()
++            await task  # never abandon a completion hook in a worker during shutdown
++
++    def tick(self) -> None:
++        with self._lock:
++            self._expire(self._clock())
++            links = list(self._links.values())
++        for link in links:
++            self.advance(link)
++
+     def create(self, key: str, *, params: dict[str, Any] | None = None, label: str | None = None) -> Link:
+         """A link for ``key`` (what it signs in: an account, a site); it replaces any open link of that key.
+         ``params`` go to the login service with each start; ``label`` is what the page names (default: the key)."""
+@@ -434,7 +466,13 @@ class Relay:
+ 
+     def app(self) -> Starlette:
+         """The routes as an app of their own, to mount where ``public_url`` points."""
+-        return Starlette(routes=self.routes())
++
++        @contextlib.asynccontextmanager
++        async def lifespan(_app):
++            async with self.lifespan():
++                yield
++
++        return Starlette(routes=self.routes(), lifespan=lifespan)
+ 
+ 
+ def with_paste(page: bytes) -> bytes:
+diff --git a/src/signin_window/service.py b/src/signin_window/service.py
+index f954d95..b0c248b 100644
+--- a/src/signin_window/service.py
++++ b/src/signin_window/service.py
+@@ -89,6 +89,7 @@ class Window:
+     info: dict[str, str] = field(default_factory=dict)
+     result: dict[str, Any] | None = field(default=None, repr=False)
+     result_at: float | None = None
++    saving_at: float | None = None
+     ended_at: float | None = None
+     procs: list[Any] = field(default_factory=list, repr=False)
+     profiles: list[str] = field(default_factory=list, repr=False)
+@@ -140,6 +141,7 @@ class Window:
+         window no longer interrupts the runner (the sign-in is done)."""
+         if self.state in ("starting", "waiting"):
+             self.state = "saving"
++            self.saving_at = time.monotonic()
+ 
+     def at(self, host: str) -> None:
+         """The host the window shows now (the page tells the person where they are)."""
+@@ -189,9 +191,16 @@ class Windows:
+         display_base: int = 90,
+         vnc_base: int = 5990,
+         clock: Callable[[], float] = time.monotonic,
++        display: str | None = None,
++        save_seconds: float = 30,
+     ) -> None:
+         if slots < 1 or slots > 9:
+             raise ValueError("slots must be 1 to 9")
++        if display is not None and (slots != 1 or not re.fullmatch(r":\d+", display)):
++            raise ValueError("an existing local display requires one slot and a :number address")
++        if save_seconds <= 0:
++            raise ValueError("save_seconds must be positive")
++        self.display, self.save_seconds = display, save_seconds
+         self.runner, self.slots, self.limit = runner, slots, minutes * 60
+         self.xvfb, self.x11vnc = xvfb, x11vnc
+         self.lock, self.lock_wait = lock, lock_wait
+@@ -266,6 +275,36 @@ class Windows:
+     async def close_all(self) -> None:
+         for window_id in list(self._windows):
+             await self.close(window_id)
++        saving = [w for w in self._windows.values() if w.state == "saving" and w.task is not None]
++        if saving:
++            tasks = [w.task for w in saving]
++            _, pending = await asyncio.wait(tasks, timeout=self.save_seconds)
++            for task in pending:
++                task.cancel()
++            await asyncio.gather(*tasks, return_exceptions=True)
++
++    @contextlib.asynccontextmanager
++    async def lifespan(self):
++        """Enforce deadlines without API traffic; drain owned work when the host stops.
++
++        Mount this once in an embedded application's lifespan. Synchronous runners must
++        cooperate with cancellation, or run as an owned child process.
++        """
++
++        async def supervise():
++            while True:
++                with self._guard:
++                    self._reap()
++                await asyncio.sleep(0.1)
++
++        watchdog = asyncio.create_task(supervise())
++        try:
++            yield self
++        finally:
++            watchdog.cancel()
++            with contextlib.suppress(asyncio.CancelledError):
++                await watchdog
++            await self.close_all()
+ 
+     async def close_key(self, key: str) -> None:
+         """Close every window of ``key`` (an account being removed, say)."""
+@@ -273,6 +312,8 @@ class Windows:
+             await self.close(window.id)
+ 
+     def _cancel(self, window: Window) -> None:
++        if window.cancelled.is_set():
++            return  # repeated deadline checks must not interrupt a runner's cleanup
+         window.cancelled.set()
+         if window.task is not None and not window.task.done():
+             window.task.cancel()
+@@ -281,6 +322,13 @@ class Windows:
+         """Windows past their time are stopped; untaken sessions and ended windows are dropped (hold ``_guard``)."""
+         now = self._clock()
+         for window in list(self._windows.values()):
++            if (
++                window.state == "saving"
++                and window.saving_at is not None
++                and time.monotonic() - window.saving_at > self.save_seconds
++            ):
++                self._cancel(window)
++                continue
+             if window.state in ("starting", "waiting") and now > window.deadline:
+                 self._cancel(window)
+             elif window.state == "signed_in" and window.result_at is not None and now - window.result_at > RESULT_TTL:
+@@ -332,6 +380,8 @@ class Windows:
+         except asyncio.CancelledError:
+             window.cancelled.set()
+             await asyncio.wait({worker})
++            with contextlib.suppress(Exception):
++                worker.result()  # retrieve a cooperative runner's cancellation failure
+             raise
+ 
+     def _end(self, window: Window, state: str, error: str | None = None, result: dict[str, Any] | None = None) -> None:
+@@ -359,9 +409,18 @@ class Windows:
+         window's, or one a just-ended window has not released yet, are skipped), and wait until both are ready."""
+         with self._guard:
+             others = [w for w in self._windows.values() if w is not window and w.ended_at is None]
+-            window.display_number = self._free_display({w.display_number for w in others})
++            window.display_number = (
++                int(self.display[1:])
++                if self.display is not None
++                else self._free_display({w.display_number for w in others})
++            )
+             window.vnc_number = self._free_port({w.vnc_number for w in others})
+         width, height = window.size
++        if self.display is None:
++            self._start_xvfb(window, width, height)
++        self._start_vnc(window)
++
++    def _start_xvfb(self, window: Window, width: int, height: int) -> None:
+         window.procs.append(
+             subprocess.Popen(
+                 [self.xvfb, window.display, "-screen", "0", f"{width}x{height}x24", "-nolisten", "tcp"],
+@@ -370,6 +429,8 @@ class Windows:
+             )
+         )
+         self._wait(lambda: (self.x_tmp / ".X11-unix" / f"X{window.display_number}").exists(), window, "Xvfb")
++
++    def _start_vnc(self, window: Window) -> None:
+         # Loopback only: the service's WebSocket bridge, behind the view token, is the one way in.
+         window.procs.append(
+             subprocess.Popen(
+@@ -620,8 +681,8 @@ def build_app(
+ 
+     @contextlib.asynccontextmanager
+     async def lifespan(_: Starlette):  # type: ignore[no-untyped-def]
+-        yield
+-        await windows.close_all()  # on shutdown: runners stop, displays and profiles go
++        async with windows.lifespan():
++            yield
+ 
+     middleware = [Middleware(BearerOnly, token=token, direct_view=direct_view)]
+     return Starlette(routes=all_routes, middleware=middleware, lifespan=lifespan)
+@@ -635,7 +696,8 @@ async def _pipe(ws: WebSocket, reader: asyncio.StreamReader, writer: asyncio.Str
+         try:
+             while True:
+                 message = await ws.receive()
+-                if message["type"] == "websocket.disconnect":
++                # Saving may begin while receive waits, before the periodic watcher runs.
++                if message["type"] == "websocket.disconnect" or not still_open():
+                     return
+                 writer.write(message.get("bytes") or (message.get("text") or "").encode())
+                 await writer.drain()
+@@ -645,6 +707,8 @@ async def _pipe(ws: WebSocket, reader: asyncio.StreamReader, writer: asyncio.Str
+     async def downstream() -> None:
+         try:
+             while data := await reader.read(65536):
++                if not still_open():
++                    return
+                 await ws.send_bytes(data)
+         except (WebSocketDisconnect, ConnectionError, RuntimeError):
+             return
+diff --git a/tests/test_child.py b/tests/test_child.py
+index 9c86901..3c22254 100644
+--- a/tests/test_child.py
++++ b/tests/test_child.py
+@@ -4,13 +4,14 @@ or failed child is stopped with its whole process group."""
+ from __future__ import annotations
+ 
+ import asyncio
++import io
+ import sys
+ import textwrap
+ from pathlib import Path
+ 
+ import pytest
+ 
+-from signin_window.child import PREFIX, WindowFailed, emit, parse, python_module, run_child
++from signin_window.child import PREFIX, WindowFailed, begin_saving, emit, parse, python_module, run_child
+ from signin_window.service import Window
+ 
+ 
+@@ -116,3 +117,109 @@ def test_emit_and_parse_round_trip(capsys):
+ 
+ def test_python_module_runs_this_interpreter():
+     assert python_module("site_login.window", "example.de") == [sys.executable, "-m", "site_login.window", "example.de"]
++
++
++def test_a_child_cannot_begin_publication_after_the_parent_pipe_closes(monkeypatch, capsys):
++    monkeypatch.setattr(sys, "stdin", io.StringIO(""))
++    with pytest.raises(WindowFailed, match="saving_not_acknowledged"):
++        begin_saving()
++    assert parse(capsys.readouterr().out.encode()) == {"state": "saving"}
++
++
++def test_a_kept_child_closes_control_before_publication_and_never_transfers_a_session(tmp_path):
++    argv = child(
++        tmp_path,
++        f"""
++        import json
++        print({PREFIX!r} + json.dumps({{"state": "waiting", "host": "accounts.example.com"}}), flush=True)
++        print({PREFIX!r} + json.dumps({{"state": "saving"}}), flush=True)
++        print({PREFIX!r} + json.dumps({{"state": "connected"}}), flush=True)
++    """,
++    )
++    w = window()
++    assert asyncio.run(run_child(w, argv, kept=True)) == {}
++    assert w.state == "saving" and w.result is None
++    assert w._outcome == ("connected", None)
++
++
++@pytest.mark.parametrize("exit_code, state", [(1, "connected"), (0, "waiting"), (0, "signed_in")])
++def test_a_kept_child_requires_explicit_completion_and_successful_exit(tmp_path, exit_code, state):
++    argv = child(
++        tmp_path,
++        f"""
++        import json, sys
++        print({PREFIX!r} + json.dumps({{"state": {state!r}}}), flush=True)
++        sys.exit({exit_code})
++    """,
++    )
++    w = window()
++    with pytest.raises(WindowFailed):
++        asyncio.run(run_child(w, argv, kept=True))
++    assert w._outcome is None and w.result is None
++
++
++@pytest.mark.parametrize("state", ["signed_in", "failed"])
++def test_a_kept_child_cannot_override_a_rejected_record_with_connected(tmp_path, state):
++    argv = child(
++        tmp_path,
++        f"""
++        import json
++        print({PREFIX!r} + json.dumps({{"state": {state!r}, "cookies": ["synthetic"]}}), flush=True)
++        print({PREFIX!r} + json.dumps({{"state": "connected"}}), flush=True)
++    """,
++    )
++    with pytest.raises(WindowFailed):
++        asyncio.run(run_child(window(), argv, kept=True))
++
++
++def test_kept_publication_waits_for_the_parent_to_revoke_control(tmp_path):
++    revoked = tmp_path / "revoked"
++    argv = child(
++        tmp_path,
++        f"""
++        import json, pathlib, sys
++        print({PREFIX!r} + json.dumps({{"state": "saving"}}), flush=True)
++        assert sys.stdin.readline() == "SIGNIN saving\\n"
++        assert pathlib.Path({str(revoked)!r}).read_text() == "saving"
++        print({PREFIX!r} + json.dumps({{"state": "connected"}}), flush=True)
++    """,
++    )
++
++    class ObservedWindow(Window):
++        def saving(self):
++            super().saving()
++            revoked.write_text(self.state)
++
++    w = ObservedWindow("w" * 24, "desktop", 3, 0.0, 60.0)
++    assert asyncio.run(run_child(w, argv, kept=True)) == {}
++
++
++def test_cancellation_waits_for_the_owned_child_to_restore_before_returning(tmp_path):
++    ready, restored = tmp_path / "ready", tmp_path / "restored"
++    argv = child(
++        tmp_path,
++        f"""
++        import pathlib, signal, time
++        def restore(*args):
++            time.sleep(0.2)
++            pathlib.Path({str(restored)!r}).write_text("restored")
++            raise SystemExit(0)
++        signal.signal(signal.SIGTERM, restore)
++        pathlib.Path({str(ready)!r}).touch()
++        time.sleep(60)
++    """,
++    )
++
++    async def scenario():
++        task = asyncio.create_task(run_child(window(), argv, kept=True, stop_seconds=2))
++        for _ in range(200):
++            if ready.exists():
++                break
++            await asyncio.sleep(0.02)
++        assert ready.exists()
++        task.cancel()
++        with pytest.raises(asyncio.CancelledError):
++            await task
++        assert restored.read_text() == "restored"
++
++    asyncio.run(scenario())
+diff --git a/tests/test_service.py b/tests/test_service.py
+index 88d0e5d..26050f8 100644
+--- a/tests/test_service.py
++++ b/tests/test_service.py
+@@ -8,6 +8,8 @@ import socket
+ import sys
+ import threading
+ import time
++from types import SimpleNamespace
++from unittest.mock import AsyncMock, Mock
+ 
+ import pytest
+ from starlette.testclient import TestClient
+@@ -20,6 +22,38 @@ TOKEN = "t" * 40
+ AUTH = {"Authorization": f"Bearer {TOKEN}"}
+ 
+ 
++@pytest.mark.parametrize("direction", ["input", "output"])
++def test_saving_revokes_an_existing_stream_before_the_periodic_watcher_runs(direction):
++    async def scenario():
++        viewable = True
++
++        async def pending():
++            await asyncio.Future()
++
++        async def after_saving(value):
++            nonlocal viewable
++            viewable = False
++            return value
++
++        ws = SimpleNamespace(
++            receive=(lambda: after_saving({"type": "websocket.receive", "bytes": b"late input"}))
++            if direction == "input"
++            else pending,
++            send_bytes=AsyncMock(),
++            close=AsyncMock(),
++        )
++        reader = SimpleNamespace(
++            read=(lambda size: after_saving(b"private pixels")) if direction == "output" else lambda size: pending()
++        )
++        writer = SimpleNamespace(write=Mock(), drain=AsyncMock(), close=Mock())
++        await service._pipe(ws, reader, writer, lambda: viewable)
++        writer.write.assert_not_called()
++        ws.send_bytes.assert_not_called()
++        ws.close.assert_awaited_once()
++
++    asyncio.run(scenario())
++
++
+ class Clock:
+     now = 1000.0
+ 

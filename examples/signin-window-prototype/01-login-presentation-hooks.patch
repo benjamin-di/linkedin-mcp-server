@@ -1,0 +1,563 @@
+From b56adc238350df201ba27ce5bfcb8ad7acf03478 Mon Sep 17 00:00:00 2001
+From: Benjamin Dickgiesser <148715513+benjamin-di@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 11:06:57 +0800
+Subject: [PATCH] feat(auth): Expose login presentation hooks
+
+Allow a host to observe manual-login progress and supply its viewer while
+retaining upstream browser launch, profile leases and session publication.
+Report confirmed cleanup separately from the existing bool result.
+---
+ README.md                          |   4 +
+ docs/docker-hub.md                 |   5 +
+ docs/login-presentation.md         |  45 ++++++
+ linkedin_mcp_server/login_hooks.py |  36 +++++
+ linkedin_mcp_server/setup.py       |  69 +++++++--
+ tests/test_login_hooks.py          | 220 +++++++++++++++++++++++++++++
+ 6 files changed, 369 insertions(+), 10 deletions(-)
+ create mode 100644 docs/login-presentation.md
+ create mode 100644 linkedin_mcp_server/login_hooks.py
+ create mode 100644 tests/test_login_hooks.py
+
+diff --git a/README.md b/README.md
+index 421c55c..a069337 100644
+--- a/README.md
++++ b/README.md
+@@ -727,6 +727,10 @@ With a paid provider, use a sticky residential session that holds one address (n
+ 
+ ## Setup from Source (Develop & Contribute)
+ 
++Applications embedding manual login can supply optional progress and viewer
++hooks; see [Embedding manual login presentation](docs/login-presentation.md).
++Browser launch and profile/session publication remain owned by this server.
++
+ Contributions are welcome. See [CONTRIBUTING.md](https://github.com/stickerdaniel/linkedin-mcp-server/blob/main/.github/CONTRIBUTING.md) for architecture guidelines and checklists. Search existing issues first, then use the [issue forms](https://github.com/stickerdaniel/linkedin-mcp-server/issues/new/choose) for anything new. AI agents follow the [issue-packet skill](https://github.com/stickerdaniel/linkedin-mcp-server/blob/main/.agents/skills/issue-packet/SKILL.md).
+ 
+ **Prerequisites:** [Git](https://git-scm.com/downloads) and [uv](https://docs.astral.sh/uv/) installed
+diff --git a/docs/docker-hub.md b/docs/docker-hub.md
+index 5d39b55..4b49070 100644
+--- a/docs/docker-hub.md
++++ b/docs/docker-hub.md
+@@ -120,6 +120,11 @@ Use `$env:USERPROFILE\.linkedin-mcp` when constructing the host path outside JSO
+ 
+ ## Environment Variables
+ 
++For a custom authenticated login front, source integrations can use optional
++[presentation hooks](https://github.com/stickerdaniel/linkedin-mcp-server/blob/main/docs/login-presentation.md).
++The host reuses the dedicated display; this server retains browser launch,
++profile leasing and session publication.
++
+ | Variable | Default | Description |
+ |----------|---------|-------------|
+ | `USER_DATA_DIR` | `~/.linkedin-mcp/profile` | Browser profile directory. The container default always works; any other path needs one run with `--claim-profile-root` first. |
+diff --git a/docs/login-presentation.md b/docs/login-presentation.md
+new file mode 100644
+index 0000000..13585a4
+--- /dev/null
++++ b/docs/login-presentation.md
+@@ -0,0 +1,45 @@
++# Embedding manual login presentation
++
++`interactive_login()` accepts optional presentation hooks without requiring a
++viewer dependency. The ordinary CLI and Docker viewer use their existing path
++when these arguments are absent.
++
++```python
++from linkedin_mcp_server.setup import interactive_login
++
++events = []
++saved = await interactive_login(
++    profile,
++    login_viewer=True,
++    viewer_factory=host_view,
++    observer=events.append,
++)
++confirmed = saved and events[-1].close_confirmed is True
++```
++
++`host_view()` returns a `login_hooks.LoginView`. Login starts its window manager
++before opening the browser, starts its remote control after browser launch,
++stops remote control before closing the browser, and stops the window manager
++afterwards. `start_remote_control()` may return a CLI URL, or `None` for a host
++that already provides an authenticated address. Each stop must tolerate partial
++startup. The factory requires explicit `login_viewer=True`.
++
++`LoginProgress` contains only `state`, the observed hostname, and optional
++`close_confirmed`. `waiting` follows navigation to the sign-in page. `saving`
++precedes cookie export: a host must revoke control before returning from this
++synchronous callback. `closed` runs after profile settlement and reports whether
++browser shutdown was confirmed. It is teardown evidence, not a success result.
++A true return alone is insufficient when shutdown could not be confirmed.
++
++An exception from `waiting` or `saving` aborts login through its ordinary cleanup
++and restoration. An exception from `closed` is logged by exception type and does
++not undo a completed save or replace the original failure. A caller cancelled
++while waiting must await cleanup before reusing the profile.
++
++The host owns its authentication, link expiry and request serialization. Use
++these hooks from an isolated login child when embedding in another event loop;
++do not change a running server's process environment. Reuse the configured
++browser, proxy and existing dedicated X display. Keep the profile lease,
++ownership claim, rotation, cookie export, source generation and restoration in
++this project's login lifecycle. Display sharing is a deployment boundary: a
++viewer can control other windows on that display.
+diff --git a/linkedin_mcp_server/login_hooks.py b/linkedin_mcp_server/login_hooks.py
+new file mode 100644
+index 0000000..dd4f193
+--- /dev/null
++++ b/linkedin_mcp_server/login_hooks.py
+@@ -0,0 +1,36 @@
++"""Optional presentation hooks; browser and session ownership stay with login."""
++
++from collections.abc import Callable
++from dataclasses import dataclass
++from typing import Literal, Protocol
++
++
++@dataclass(frozen=True)
++class LoginProgress:
++    """Public progress only: no page content, cookies, profile path or credentials.
++
++    ``saving`` precedes cookie export; ``closed`` reports teardown evidence.
++    A saved session requires a true return from ``interactive_login`` and
++    confirmed closure. Progress alone never asserts successful publication.
++    """
++
++    state: Literal["waiting", "saving", "closed"]
++    host: str = ""
++    close_confirmed: bool | None = None
++
++
++LoginObserver = Callable[[LoginProgress], None]
++
++
++class LoginView(Protocol):
++    """A presentation surface whose resources the login lifecycle closes."""
++
++    def start_window_manager(self) -> None: ...
++
++    def start_remote_control(self) -> str | None:
++        """Return a CLI viewer address, or None when the host already serves it."""
++        ...
++
++    def stop_remote_control(self) -> None: ...
++
++    def stop_window_manager(self) -> None: ...
+diff --git a/linkedin_mcp_server/setup.py b/linkedin_mcp_server/setup.py
+index 332a951..581f61f 100644
+--- a/linkedin_mcp_server/setup.py
++++ b/linkedin_mcp_server/setup.py
+@@ -10,9 +10,11 @@ from collections.abc import Callable, Coroutine, Iterator
+ from contextlib import contextmanager
+ from dataclasses import dataclass
+ import functools
++import logging
+ from pathlib import Path
+ import signal
+ from typing import Any
++from urllib.parse import urlsplit
+ 
+ from linkedin_mcp_server.browser_launch import build_launch_options, describe_launch
+ from linkedin_mcp_server.config import get_config
+@@ -25,6 +27,7 @@ from linkedin_mcp_server.core import (
+ )
+ from linkedin_mcp_server.exceptions import BrowserBusyError
+ from linkedin_mcp_server.login_viewer import LoginViewer, VIEWER_WALL_SECONDS
++from linkedin_mcp_server.login_hooks import LoginObserver, LoginProgress, LoginView
+ from linkedin_mcp_server.process_tree import (
+     release_browser_guardian,
+     start_browser_guardian,
+@@ -42,12 +45,16 @@ from linkedin_mcp_server.session_state import (
+ 
+ from linkedin_mcp_server.drivers.browser import close_browser, get_profile_dir
+ 
++logger = logging.getLogger(__name__)
++
+ 
+ async def interactive_login(
+     user_data_dir: Path | None = None,
+     *,
+     superseded_by: str | None | object = UNGUARDED,
+     login_viewer: bool = False,
++    observer: LoginObserver | None = None,
++    viewer_factory: Callable[[], LoginView] | None = None,
+ ) -> bool:
+     """
+     Open browser for manual LinkedIn login with persistent profile.
+@@ -64,13 +71,21 @@ async def interactive_login(
+             holds the profile, because somebody else has already done the work.
+             Left at :data:`UNGUARDED` by callers with nothing to compare against,
+             such as ``--login`` typed at a terminal.
++        login_viewer: Enable the built-in viewer or an injected presentation.
++        observer: Synchronous public progress callback. Waiting/saving failures
++            abort through normal cleanup; closed failures are logged by type.
++        viewer_factory: Optional LoginView factory, requiring login_viewer=True.
++            The login lifecycle starts and stops its presentation resources.
+ 
+     Returns:
+-        True if login was successful, or a peer's session is already in place
++        True if login was successful, or a peer's session is already in place.
++        Embedders also require closed.close_confirmed before advertising success.
+ 
+     Raises:
+         Exception: If login fails or times out
+     """
++    if viewer_factory is not None and not login_viewer:
++        raise ValueError("viewer_factory requires login_viewer=True")
+     if user_data_dir is None:
+         user_data_dir = get_profile_dir()
+ 
+@@ -124,7 +139,11 @@ async def interactive_login(
+             print("   Another client already signed in; using its session.")
+             return True
+ 
+-        login_kwargs = {"login_viewer": True} if login_viewer else {}
++        login_kwargs: dict[str, Any] = {"login_viewer": True} if login_viewer else {}
++        if observer is not None:
++            login_kwargs["observer"] = observer
++        if viewer_factory is not None:
++            login_kwargs["viewer_factory"] = viewer_factory
+         return await _login_holding_the_profile(
+             user_data_dir, lease, state, **login_kwargs
+         )
+@@ -145,6 +164,14 @@ async def interactive_login(
+                 "   Warning: the login browser did not shut down cleanly. "
+                 "Restart the server before using this profile again."
+             )
++        if observer is not None:
++            try:
++                observer(LoginProgress("closed", close_confirmed=state.close_confirmed))
++            except Exception as exc:
++                # Observation cannot undo a completed save or replace its cleanup failure.
++                logger.warning(
++                    "Login observer failed after cleanup: %s", type(exc).__name__
++                )
+ 
+ 
+ @dataclass
+@@ -168,6 +195,8 @@ async def _login_holding_the_profile(
+     state: _LoginState,
+     *,
+     login_viewer: bool = False,
++    observer: LoginObserver | None = None,
++    viewer_factory: Callable[[], LoginView] | None = None,
+ ) -> bool:
+     """Rotate and log in; the caller owns the profile for the whole flow."""
+     # Rotation must happen before the browser is marked open: the exclusivity
+@@ -189,7 +218,11 @@ async def _login_holding_the_profile(
+     state.browser_opened = True
+     state.close_confirmed = False
+     try:
+-        login_kwargs = {"login_viewer": True} if login_viewer else {}
++        login_kwargs: dict[str, Any] = {"login_viewer": True} if login_viewer else {}
++        if observer is not None:
++            login_kwargs["observer"] = observer
++        if viewer_factory is not None:
++            login_kwargs["viewer_factory"] = viewer_factory
+         succeeded = await _login_into_fresh_profile(
+             user_data_dir,
+             config=get_config(),
+@@ -248,6 +281,8 @@ async def _login_into_fresh_profile(
+     config: Any,
+     state: _LoginState,
+     login_viewer: bool = False,
++    observer: LoginObserver | None = None,
++    viewer_factory: Callable[[], LoginView] | None = None,
+ ) -> bool:
+     """Drive the manual login against a freshly retired profile directory.
+ 
+@@ -287,7 +322,7 @@ async def _login_into_fresh_profile(
+         viewport=viewport,
+         **launch_options,
+     )
+-    viewer = LoginViewer() if login_viewer else None
++    viewer = (viewer_factory or LoginViewer)() if login_viewer else None
+     failure: BaseException | None = None
+     handed_over = False
+     try:
+@@ -297,8 +332,14 @@ async def _login_into_fresh_profile(
+         # the manager's verdict is an answer about this profile. Before here it
+         # is only its pessimistic default, which is not the same thing.
+         handed_over = True
++        progress_kwargs = {"observer": observer} if observer is not None else {}
+         result = await _run_login(
+-            manager, user_data_dir, config, login_timeout_ms, viewer=viewer
++            manager,
++            user_data_dir,
++            config,
++            login_timeout_ms,
++            viewer=viewer,
++            **progress_kwargs,
+         )
+         if not result:
+             failure = RuntimeError("login did not produce a portable session")
+@@ -333,21 +374,27 @@ async def _run_login(
+     config: Any,
+     login_timeout_ms: int,
+     *,
+-    viewer: LoginViewer | None = None,
++    viewer: LoginView | None = None,
++    observer: LoginObserver | None = None,
+ ) -> bool:
+     async with manager as browser:
+         if viewer is not None:
+             url = viewer.start_remote_control()
+-            print(
+-                f"Open this loopback URL to control the login browser:\n{url}",
+-                flush=True,
+-            )
++            if url is not None:
++                print(
++                    f"Open this loopback URL to control the login browser:\n{url}",
++                    flush=True,
++                )
+         failure: BaseException | None = None
+         try:
+             # Navigate to LinkedIn login
+             await goto_reporting_proxy_errors(
+                 browser.page, "https://www.linkedin.com/login"
+             )
++            if observer is not None:
++                observer(
++                    LoginProgress("waiting", urlsplit(browser.page.url).hostname or "")
++                )
+             # Let LinkedIn finish rendering the saved-account chooser, then retry
+             # the same exact click target before the normal manual-login wait.
+             for _ in range(3):
+@@ -358,6 +405,8 @@ async def _run_login(
+             # Wait for manual login completion. The budget comes from
+             # LOGIN_TIMEOUT (config.browser.login_timeout_seconds); 0 = unlimited.
+             await wait_for_manual_login(browser.page, timeout=login_timeout_ms)
++            if observer is not None:
++                observer(LoginProgress("saving"))
+ 
+             # Wait for persistent context to flush cookies to disk
+             await asyncio.sleep(2)
+diff --git a/tests/test_login_hooks.py b/tests/test_login_hooks.py
+new file mode 100644
+index 0000000..2348e6f
+--- /dev/null
++++ b/tests/test_login_hooks.py
+@@ -0,0 +1,220 @@
++"""Presentation observes the existing login without owning its profile lifetime."""
++
++from dataclasses import asdict
++from types import SimpleNamespace
++from unittest.mock import AsyncMock, MagicMock
++
++import pytest
++
++from linkedin_mcp_server import setup
++from linkedin_mcp_server.config.schema import AppConfig
++from linkedin_mcp_server.login_hooks import LoginProgress
++
++
++@pytest.fixture
++def login(monkeypatch, tmp_path):
++    trace = []
++    config = AppConfig()
++    config.browser.chrome_path = "/synthetic/chrome"
++    config.browser.proxy_server = "http://proxy.example:8080"
++    browser = SimpleNamespace(
++        page=SimpleNamespace(url="https://www.linkedin.com/login"),
++        context=SimpleNamespace(
++            cookies=AsyncMock(
++                return_value=[{"name": "li_at", "value": "synthetic-cookie"}]
++            )
++        ),
++        export_cookies=AsyncMock(
++            side_effect=lambda *args: trace.append("export") or True
++        ),
++    )
++    managers = []
++
++    class Manager:
++        def __init__(self, **kwargs):
++            self.kwargs = kwargs
++            self.close_confirmed = False
++            self.confirm_close = True
++            managers.append(self)
++
++        async def __aenter__(self):
++            trace.append("browser-open")
++            return browser
++
++        async def __aexit__(self, *args):
++            trace.append("browser-close")
++            self.close_confirmed = self.confirm_close
++
++    lease = SimpleNamespace(
++        acquire=AsyncMock(return_value=True),
++        guardian_fd=lambda: None,
++        mark_browser_open=lambda: trace.append("mark-open"),
++        mark_browser_closed=lambda: trace.append("mark-closed"),
++        release=lambda: trace.append("lease-release"),
++    )
++    monkeypatch.setattr(setup, "get_config", lambda: config)
++    monkeypatch.setattr(setup, "BrowserManager", Manager)
++    monkeypatch.setattr(setup, "get_profile_lease", lambda *args: lease)
++    monkeypatch.setattr(setup, "close_browser", AsyncMock())
++    monkeypatch.setattr(
++        setup, "rotate_shielded", AsyncMock(return_value=tmp_path / "retired")
++    )
++    restore = MagicMock(side_effect=lambda *args: trace.append("restore") or True)
++    monkeypatch.setattr(setup, "restore_source_profile", restore)
++    monkeypatch.setattr(setup, "start_browser_guardian", lambda *args: None)
++    monkeypatch.setattr(
++        setup, "release_browser_guardian", lambda: trace.append("guardian-release")
++    )
++    monkeypatch.setattr(setup, "goto_reporting_proxy_errors", AsyncMock())
++    monkeypatch.setattr(
++        setup, "resolve_remember_me_prompt", AsyncMock(return_value=True)
++    )
++    monkeypatch.setattr(setup, "wait_for_manual_login", AsyncMock())
++    monkeypatch.setattr(setup.asyncio, "sleep", AsyncMock())
++    monkeypatch.setattr(
++        setup,
++        "write_source_state",
++        lambda *args: (
++            trace.append("publish")
++            or SimpleNamespace(login_generation="synthetic-generation")
++        ),
++    )
++
++    class Viewer:
++        def start_window_manager(self):
++            trace.append("wm-start")
++
++        def start_remote_control(self):
++            trace.append("view-start")
++            return None
++
++        def stop_remote_control(self):
++            trace.append("view-stop")
++
++        def stop_window_manager(self):
++            trace.append("wm-stop")
++
++    return SimpleNamespace(
++        trace=trace,
++        browser=browser,
++        managers=managers,
++        config=config,
++        viewer=Viewer,
++        restore=restore,
++        lease=lease,
++        profile=tmp_path / "profile",
++    )
++
++
++@pytest.mark.asyncio
++async def test_progress_closes_only_after_browser_and_lease_cleanup(login, capsys):
++    events = []
++
++    def observe(event):
++        events.append(event)
++        login.trace.append(event.state)
++
++    assert await setup.interactive_login(
++        login.profile, login_viewer=True, viewer_factory=login.viewer, observer=observe
++    )
++    trace = login.trace
++    assert (
++        trace.index("waiting")
++        < trace.index("saving")
++        < trace.index("export")
++        < trace.index("publish")
++    )
++    assert (
++        trace.index("view-stop") < trace.index("browser-close") < trace.index("wm-stop")
++    )
++    assert trace.index("wm-stop") < trace.index("lease-release") < trace.index("closed")
++    assert events[-1].close_confirmed is True
++    assert events[0].host == "www.linkedin.com"
++    for event in events:
++        assert set(asdict(event)) == {"state", "host", "close_confirmed"}
++        assert "synthetic-cookie" not in str(event) and str(login.profile) not in str(
++            event
++        )
++    assert "loopback URL" not in capsys.readouterr().out
++    options = login.managers[0].kwargs
++    assert options["executable_path"] == "/synthetic/chrome"
++    assert options["proxy"] == {"server": "http://proxy.example:8080"}
++    assert options["headless"] is False
++    assert "user_agent" not in options and "env" not in options
++
++
++@pytest.mark.asyncio
++async def test_observer_failure_before_export_runs_normal_restore(login):
++    def observe(event):
++        if event.state == "saving":
++            raise RuntimeError("synthetic observer failure")
++
++    with pytest.raises(RuntimeError, match="observer failure"):
++        await setup.interactive_login(
++            login.profile,
++            login_viewer=True,
++            viewer_factory=login.viewer,
++            observer=observe,
++        )
++    login.browser.export_cookies.assert_not_awaited()
++    login.restore.assert_called_once()
++    assert (
++        login.trace.index("browser-close")
++        < login.trace.index("restore")
++        < login.trace.index("lease-release")
++    )
++
++
++@pytest.mark.asyncio
++async def test_failed_export_keeps_failure_and_restores_the_previous_session(login):
++    events = []
++    login.browser.export_cookies.side_effect = lambda *args: False
++    assert not await setup.interactive_login(
++        login.profile,
++        login_viewer=True,
++        viewer_factory=login.viewer,
++        observer=events.append,
++    )
++    login.restore.assert_called_once()
++    assert "publish" not in login.trace
++    assert events[-1] == LoginProgress("closed", close_confirmed=True)
++
++
++@pytest.mark.asyncio
++async def test_unconfirmed_teardown_is_reported_without_releasing_the_profile(login):
++    events = []
++
++    def observe(event):
++        events.append(event)
++        if event.state == "waiting":
++            login.managers[0].confirm_close = False
++
++    await setup.interactive_login(
++        login.profile, login_viewer=True, viewer_factory=login.viewer, observer=observe
++    )
++    assert events[-1] == LoginProgress("closed", close_confirmed=False)
++    assert "lease-release" not in login.trace and "guardian-release" not in login.trace
++    login.restore.assert_not_called()
++
++
++@pytest.mark.asyncio
++async def test_post_cleanup_observer_failure_does_not_undo_a_saved_session(
++    login, caplog
++):
++    def observe(event):
++        if event.state == "closed":
++            raise RuntimeError("synthetic-cookie must not enter logs")
++
++    assert await setup.interactive_login(
++        login.profile, login_viewer=True, viewer_factory=login.viewer, observer=observe
++    )
++    assert "publish" in login.trace and "lease-release" in login.trace
++    assert "synthetic-cookie" not in caplog.text
++    login.restore.assert_not_called()
++
++
++@pytest.mark.asyncio
++async def test_injected_viewer_requires_explicit_viewer_mode(login):
++    with pytest.raises(ValueError, match="login_viewer"):
++        await setup.interactive_login(login.profile, viewer_factory=login.viewer)
++    assert login.managers == []
+-- 
+2.43.0
+

@@ -241,8 +241,8 @@ class TestTheWindowlessLaunchEndToEnd:
     alone. This one runs the launch through and reads what came out.
     """
 
+    @staticmethod
     def _fake_playwright(
-        self,
         recorder: dict,
         *,
         refuse_headed: bool = False,
@@ -586,7 +586,7 @@ class TestTheHeadlessFallbackWaitsForTheFirstLaunchToGo:
     from an ordinary headed refusal on a Mac with no window server.
     """
 
-    _fake_playwright = TestTheWindowlessLaunchEndToEnd._fake_playwright
+    _fake_playwright = staticmethod(TestTheWindowlessLaunchEndToEnd._fake_playwright)
 
     @staticmethod
     def _drain(recorder: dict, monkeypatch, *, proves: bool) -> None:

@@ -1928,7 +1928,7 @@ class _Scene(_CalibrationScene):
     async def http_host(self, *args, **kwargs):
         return await self.host(*args, transport=STREAMABLE_HTTP, **kwargs)
 
-    async def run(self, row: str, *, daemon: bool = True):  # ty: ignore[invalid-method-override]
+    async def run(self, row: str, *, daemon: bool = True):  # ty: ignore[incompatible-method-override]
         return await measure_host_quit_row(
             profile=self.tmp_path / "auth" / "profile",
             experiment="K3" if daemon else "K1",

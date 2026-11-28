@@ -410,8 +410,8 @@ class _JobHandle:
 
 
 class TestWindowsJobSetup:
+    @staticmethod
     def _modules(
-        self,
         events: list[tuple[str, Any]],
         handle: _JobHandle,
         *,
@@ -508,8 +508,8 @@ class TestWindowsJobSetup:
             "win32process": _Win32Process,
         }
 
+    @staticmethod
     def _patch_modules(
-        self,
         monkeypatch: pytest.MonkeyPatch,
         modules: dict[str, object],
     ) -> None:
@@ -3712,8 +3712,8 @@ def test_a_windows_launch_without_a_job_cannot_prove_its_shutdown(
 class TestTheBrowserLaunchJob:
     """One Job per browser, created before the driver can spawn anything."""
 
-    _modules = TestWindowsJobSetup._modules
-    _patch_modules = TestWindowsJobSetup._patch_modules
+    _modules = staticmethod(TestWindowsJobSetup._modules)
+    _patch_modules = staticmethod(TestWindowsJobSetup._patch_modules)
 
     def _windows(
         self,

@@ -131,7 +131,7 @@ def _not_loopback(host: str) -> list[str]:
 
 
 class _CanaryHandler(BaseHTTPRequestHandler):
-    server: _Canary  # ty: ignore[invalid-mutable-override]
+    server: _Canary  # ty: ignore[incompatible-mutable-override]
 
     def do_GET(self) -> None:
         self.server.hosts.append(self.headers.get("Host", ""))

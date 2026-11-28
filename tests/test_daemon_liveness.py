@@ -425,7 +425,7 @@ class TestTheFrontendSide:
             beats.append((attachment.descriptor.instance_id, call_id))
             return httpx2.Response(status, json={"watched": False})
 
-        middleware._beat = beat  # ty: ignore[invalid-assignment]
+        middleware._beat = beat
         return middleware
 
     @staticmethod

@@ -72,7 +72,7 @@ class CompactFormatter(logging.Formatter):
             lineno=record.lineno,
             msg=record.msg,
             args=record.args,
-            exc_info=record.exc_info,
+            exc_info=record.exc_info or None,
             func=record.funcName,
         )
         record_copy.stack_info = record.stack_info

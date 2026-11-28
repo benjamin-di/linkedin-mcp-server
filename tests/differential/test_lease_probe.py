@@ -179,7 +179,7 @@ def _spying(monkeypatch):
         def _execute_child(self, *args, **kwargs):
             # Private to subprocess, so absent from its stubs: the step that
             # forks, inside Popen.__init__.
-            super()._execute_child(*args, **kwargs)  # ty: ignore[unresolved-attribute]
+            super()._execute_child(*args, **kwargs)  # ty: ignore[missing-attribute]
             if spy.forked is not None:
                 raise spy.forked
 
